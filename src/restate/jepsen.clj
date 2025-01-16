@@ -19,15 +19,16 @@
    [slingshot.slingshot :refer [try+]]
    [knossos.model :as model]))
 
-(def server-dir "/opt/restate/")
-(def server-binary "restate-server")
-(def server-logfile (str server-dir "/restate.log"))
-(def server-pidfile (str server-dir "/restate.pid"))
-(def services-dir "/opt/services/")
-(def services-binary "/usr/bin/node")
-(def services-args (str services-dir "services.js"))
-(def services-pidfile (str services-dir "services.pid"))
-(def services-logfile (str services-dir "services.log"))
+(def services-relative-path ".")
+(def server-restate-root "/opt/restate/")
+(def server-restate-binary "restate-server")
+(def server-logfile (str server-restate-root "/restate.log"))
+(def server-pidfile (str server-restate-root "/restate.pid"))
+(def server-services-dir "/opt/services/")
+(def node-binary "/usr/bin/node")
+(def services-args (str server-services-dir "services.js"))
+(def services-pidfile (str server-services-dir "services.pid"))
+(def services-logfile (str server-services-dir "services.log"))
 
 (defn restate
   "A deployment of Restate along with the required test services."
@@ -39,7 +40,7 @@
        (c/exec :apt :install :-y :nodejs)
 
        (c/exec :mkdir :-p "/opt/services")
-       (c/upload "/restate/services/dist/services.zip" "/opt/services.zip")
+       (c/upload (str services-relative-path "/services/dist/services.zip") "/opt/services.zip")
        (cu/install-archive! "file:///opt/services.zip" "/opt/services")
        (c/exec :rm "/opt/services.zip")
 
@@ -47,18 +48,19 @@
         {:logfile services-logfile
          :pidfile services-pidfile
          :chdir   "/opt/services"}
-        services-binary services-args)
+        node-binary services-args)
        (cu/await-tcp-port 9080)
 
-       (let [url (str "https://github.com/restatedev/restate/releases/download/"
-                      version "/restate.aarch64-unknown-linux-musl.tar.gz")]
-         (cu/install-archive! url server-dir))
+       (let [arch (c/exec :uname :-m)
+             url (str "https://github.com/restatedev/restate/releases/download/"
+                      version "/restate." arch "-unknown-linux-musl.tar.gz")]
+         (cu/install-archive! url server-restate-root))
 
        (cu/start-daemon!
         {:logfile server-logfile
          :pidfile server-pidfile
-         :chdir   server-dir}
-        server-binary
+         :chdir   server-restate-root}
+        server-restate-binary
         :--cluster-name "jepsen-test")
        (cu/await-tcp-port 9070)
        (cu/await-tcp-port 8080)
@@ -67,10 +69,10 @@
 
     (teardown! [_this _test node]
       (info node "Tearing down Restate")
-      (cu/stop-daemon! server-binary server-pidfile)
-      (cu/stop-daemon! services-binary services-pidfile)
-      (c/su (c/exec :rm :-rf server-dir))
-      (c/su (c/exec :rm :-rf services-dir)))
+      (cu/stop-daemon! server-restate-binary server-pidfile)
+      (cu/stop-daemon! node-binary services-pidfile)
+      (c/su (c/exec :rm :-rf server-restate-root))
+      (c/su (c/exec :rm :-rf server-services-dir)))
 
     db/LogFiles (log-files [_this _test _node] [server-logfile services-logfile])))
 
@@ -156,7 +158,7 @@
             :name            (str "restate" (name (:workload opts)))
             :quorum          quorum
             :os              debian/os
-            :db              (restate "v1.1.2")
+            :db              (restate "v1.1.6")
             :client          (:client workload)
             :checker         (checker/compose
                               {:perf     (checker/perf)
@@ -184,7 +186,7 @@
     :validate [pos? "Must be a positive integer."]]])
 
 (defn -main
-  "CLI entry point. Start test or web server or viewing results."
+  "CLI entry point. Start test or web server for viewing results."
   [& args]
   (cli/run!
    (merge
