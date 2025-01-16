@@ -19,7 +19,7 @@
    [slingshot.slingshot :refer [try+]]
    [knossos.model :as model]))
 
-(def services-relative-path ".")
+(def resources-relative-path ".")
 (def server-restate-root "/opt/restate/")
 (def server-restate-binary "restate-server")
 (def server-logfile (str server-restate-root "/restate.log"))
@@ -34,13 +34,13 @@
   "A deployment of Restate along with the required test services."
   [version]
   (reify db/DB
-    (setup! [_db _test node]
+    (setup! [_db test node]
       (info node "Setting up Restate Server" version "for testing")
       (c/su
-       (c/exec :apt :install :-y :nodejs)
+       (c/exec :apt :install :-y :docker.io :nodejs :npm)
 
        (c/exec :mkdir :-p "/opt/services")
-       (c/upload (str services-relative-path "/services/dist/services.zip") "/opt/services.zip")
+       (c/upload (str resources-relative-path "/services/dist/services.zip") "/opt/services.zip")
        (cu/install-archive! "file:///opt/services.zip" "/opt/services")
        (c/exec :rm "/opt/services.zip")
 
@@ -51,28 +51,48 @@
         node-binary services-args)
        (cu/await-tcp-port 9080)
 
-       (let [arch (c/exec :uname :-m)
-             url (str "https://github.com/restatedev/restate/releases/download/"
-                      version "/restate." arch "-unknown-linux-musl.tar.gz")]
-         (cu/install-archive! url server-restate-root))
+       (c/exec :docker :rm :-f "restate")
 
-       (cu/start-daemon!
-        {:logfile server-logfile
-         :pidfile server-pidfile
-         :chdir   server-restate-root}
-        server-restate-binary
-        :--cluster-name "jepsen-test")
+       (c/upload (str resources-relative-path "/config/config.toml") "/opt/config.toml")
+       (let [node-name (str "n" (inc (.indexOf (:nodes test) node)))
+             node-id (inc (.indexOf (:nodes test) node))
+             metadata-store-address (str "http://" (first (:nodes test)) ":5122/")]
+         (info "Starting node `" node-name "` with: " :--node-name (str "n" (inc (.indexOf (:nodes test) node)))
+               :--force-node-id node-id
+               :--allow-bootstrap (if (= node (first (:nodes test))) "true" "false")
+               :--metadata-store-address metadata-store-address)
+         (c/exec
+          :docker
+          :run
+          :--name=restate
+          :--network=host
+          :--add-host :host.docker.internal:host-gateway
+          :--detach
+          :--volume "/opt/config.toml:/config.toml"
+          :--volume "/opt/restate/restate-data:/restate-data"
+          :--env (str "RESTATE_METADATA_STORE_CLIENT__ADDRESS=" metadata-store-address)
+          (:image test)
+          :--node-name node-name
+          :--force-node-id node-id
+          :--allow-bootstrap (if (= node (first (:nodes test))) "true" "false")
+          :--auto-provision-partitions (if (= node (first (:nodes test))) "true" "false")
+          :--config-file "/config.toml"
+          ;;:--metadata-store-address metadata-store-address
+          ))
        (cu/await-tcp-port 9070)
        (cu/await-tcp-port 8080)
 
-       (c/exec "/opt/restate/restate" :deployments :register "localhost:9080" :--yes)))
+       (when (= node (first (:nodes test)))
+         (info "Registering Restate service on first node")
+         (c/exec :npx "@restatedev/restate" :deployments :register "http://host.docker.internal:9080" :--yes))))
 
     (teardown! [_this _test node]
       (info node "Tearing down Restate")
-      (cu/stop-daemon! server-restate-binary server-pidfile)
-      (cu/stop-daemon! node-binary services-pidfile)
-      (c/su (c/exec :rm :-rf server-restate-root))
-      (c/su (c/exec :rm :-rf server-services-dir)))
+      (c/su
+       (cu/stop-daemon! server-restate-binary server-pidfile)
+       (c/exec :rm :-rf server-restate-root)
+       (c/exec :rm :-rf server-services-dir)
+       (cu/stop-daemon! node-binary services-pidfile)))
 
     db/LogFiles (log-files [_this _test _node] [server-logfile services-logfile])))
 
@@ -145,18 +165,15 @@
   "Given an options map from the command line runner (e.g. :nodes, :ssh,
   :concurrency ...), constructs a test map. Special options:
 
-      :quorum       Whether to use quorum reads
       :rate         Approximate number of requests per second, per thread
       :ops-per-key  Maximum number of operations allowed on any given key.
       :workload     Type of workload."
   [opts]
-  (let [quorum   (boolean (:quorum opts))
-        workload ((get workloads (:workload opts)) opts)]
+  (let [workload ((get workloads (:workload opts)) opts)]
     (merge tests/noop-test
            opts
            {:pure-generators true
-            :name            (str "restate" (name (:workload opts)))
-            :quorum          quorum
+            :name            (str "restate " (name (:workload opts)))
             :os              debian/os
             :db              (restate "v1.1.6")
             :client          (:client workload)
@@ -173,7 +190,9 @@
 
 (def cli-opts
   "Additional command line options."
-  [["-w" "--workload NAME" "Workload to run"
+  [["-i" "--image STRING" "Restate container version"
+    :default "ghcr.io/restatedev/restate:main"]
+   ["-w" "--workload NAME" "Workload to run"
     :missing  (str "--workload " (cli/one-of workloads))
     :validate (workloads (cli/one-of workloads))]
    ["-r" "--rate HZ" "Approximate number of requests per second, per thread."

@@ -1,0 +1,24 @@
+cluster-name = "restate-jepsen"
+#roles = ["worker", "admin", "metadata-store", "log-server"]
+#allow-bootstrap = true
+bind-address = "0.0.0.0:5122"
+metadata-store-connect-timeout = "5s"
+metadata-store-keep-alive-interval = "40s"
+metadata-store-keep-alive-timeout = "20s"
+bootstrap-num-partitions = 4
+tracing-filter = "info"
+log-filter = "restate=debug"
+log-format = "compact"
+rocksdb-total-memory-size = "512 MB"
+
+[admin]
+#bind-address = "0.0.0.0:9070"
+heartbeat-interval = "1s"
+default-replication-strategy = "on-all-nodes"
+
+[metadata-store-client]
+#type = "embedded"
+#address = "http://127.0.0.1:5122/"
+
+[bifrost]
+default-provider = "replicated"
