@@ -71,20 +71,26 @@
           :--volume "/opt/config.toml:/config.toml"
           :--volume "/opt/restate/restate-data:/restate-data"
           :--env (str "RESTATE_METADATA_STORE_CLIENT__ADDRESS=" metadata-store-address)
+          :--env (str "RESTATE_ADVERTISED_ADDRESS=" (str "http://" node ":5122"))
           (:image test)
           :--node-name node-name
           :--force-node-id node-id
           :--allow-bootstrap (if (= node (first (:nodes test))) "true" "false")
           :--auto-provision-partitions (if (= node (first (:nodes test))) "true" "false")
           :--config-file "/config.toml"
-          ;;:--metadata-store-address metadata-store-address
+          :--roles (str (if (= node (first (:nodes test))) "admin,metadata-store," nil) "worker,log-server,http-ingress")
+          ;; :--metadata-store-address metadata-store-address ;; TODO: this doesn't seem to have an effect
+          ;; :--advertise-address (str "http://" node ":5122") ;; TODO: this doesn't seem to have an effect
           ))
-       (cu/await-tcp-port 9070)
        (cu/await-tcp-port 8080)
 
        (when (= node (first (:nodes test)))
          (info "Registering Restate service on first node")
-         (c/exec :npx "@restatedev/restate" :deployments :register "http://host.docker.internal:9080" :--yes))))
+         (cu/await-tcp-port 9070)
+         (c/exec :npx "@restatedev/restate" :deployments :register "http://host.docker.internal:9080" :--yes))
+
+       ;; hack to make sure all nodes see the deployment before we start - make this more intelligent
+       (Thread/sleep 5000)))
 
     (teardown! [_this _test node]
       (info node "Tearing down Restate")
