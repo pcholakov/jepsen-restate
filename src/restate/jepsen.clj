@@ -56,7 +56,7 @@
        (c/upload (str resources-relative-path "/config/config.toml") "/opt/config.toml")
        (let [node-name (str "n" (inc (.indexOf (:nodes test) node)))
              node-id (inc (.indexOf (:nodes test) node))
-             metadata-store-address (str "http://" (first (:nodes test)) ":5122/")]
+             metadata-store-address (str "http://" (first (:nodes test)) ":5122")]
          (info "Starting node `" node-name "` with: " :--node-name (str "n" (inc (.indexOf (:nodes test) node)))
                :--force-node-id node-id
                :--allow-bootstrap (if (= node (first (:nodes test))) "true" "false")
@@ -87,10 +87,7 @@
        (when (= node (first (:nodes test)))
          (info "Registering Restate service on first node")
          (cu/await-tcp-port 9070)
-         (c/exec :npx "@restatedev/restate" :deployments :register "http://host.docker.internal:9080" :--yes))
-
-       ;; hack to make sure all nodes see the deployment before we start - make this more intelligent
-       (Thread/sleep 5000)))
+         (c/exec :npx "@restatedev/restate" :deployments :register "http://host.docker.internal:9080" :--yes))))
 
     (teardown! [_this _test node]
       (info node "Tearing down Restate")
@@ -134,10 +131,17 @@
                                      :content-type :json})
                          (assoc op :type :ok)))
 
-                (catch [:status 412] _
-                  (assoc op
-                         :type  :fail
-                         :error :precondition-failed)))))
+                (catch [:status 412] {} (assoc op
+                                               :type  :fail
+                                               :error :precondition-failed))
+
+                (catch [:status 404] {} (assoc op
+                                               :type  :fail
+                                               :error :not-found))
+
+                ;; if we let HTTP exceptions bubble up, Jepsen will try serialize them and fail during reporting phase
+                (catch Object {} (assoc op
+                                        :type  :fail)))))
 
            (teardown! [_this _test])
 
