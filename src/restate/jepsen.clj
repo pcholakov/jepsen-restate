@@ -35,7 +35,7 @@
   [version]
   (reify db/DB
     (setup! [_db test node]
-      (when (not (= "localhost" node))
+      (when (not (:dummy? (:ssh test)))
         (info node "Setting up Restate Server" version "for testing")
         (c/su
          (c/exec :apt :install :-y :docker.io :nodejs :npm)
@@ -97,8 +97,8 @@
            (cu/await-tcp-port 9070)
            (c/exec :npx "@restatedev/restate" :deployments :register "http://host.docker.internal:9080" :--yes)))))
 
-    (teardown! [_this _test node]
-      (when (not (= "localhost" node))
+    (teardown! [_this test node]
+      (when (not (:dummy? (:ssh test)))
         (info node "Tearing down Restate")
         (c/su
          (cu/stop-daemon! server-restate-binary server-pidfile)
@@ -163,9 +163,11 @@
 
  (setup! [_this _test])
 
- (open! [this _test node] (assoc this :admin-api (str "http://" node ":9070")))
+ (open! [this _test node] (assoc this
+                                 :admin-api (str "http://" node ":9070")
+                                 :random (new java.util.Random)))
 
- (invoke! [_client _test op]
+ (invoke! [this _test op]
    (let [[k v] (:value op)]
      (try+
       (case (:f op)
@@ -178,28 +180,26 @@
         :write (do
                  (http/put (str admin-api "/metadata/" k)
                            {:body (json/generate-string v)
-                            :headers {:If-Match "*" :ETag 1}
+                            :headers {:If-Match "*"
+                                      :ETag (bit-shift-left (abs (.nextInt (:random this))) 1)}
                             :content-type :json})
                  (assoc op :type :ok))
 
-        :cas (let [[expected-value new-value] v]
-               (let
-                [[stored-value stored-version]
-                 (try+
-                  (let [res (http/get (str admin-api "/metadata/" k))]
-                    [(parse-long-nil (:body res)) (parse-long-nil (->> res (:headers) (:ETag)))])
-                  (catch [:status 404] {} [nil nil]))]
-                 (if (= stored-value expected-value)
-                   (do (http/put (str admin-api "/metadata/" k)
-                                 {:body (json/generate-string new-value)
-                                  :content-type :json
-                                  :headers {:If-Match stored-version
-                                            :ETag (inc stored-version)}})
-                       (assoc op :type :ok))
-                   (do
-                     (assoc op
-                            :type :fail
-                            :error :precondition-failed))))))
+        :cas (let [[expected-value new-value] v
+                   [stored-value stored-version]
+                   (try+
+                    (let [res (http/get (str admin-api "/metadata/" k))]
+                      [(parse-long-nil (:body res)) (parse-long-nil (->> res (:headers) (:ETag)))])
+                    (catch [:status 404] {} [nil nil]))]
+
+               (if (= stored-value expected-value)
+                 (do (http/put (str admin-api "/metadata/" k)
+                               {:body (json/generate-string new-value)
+                                :content-type :json
+                                :headers {:If-Match stored-version
+                                          :ETag (inc stored-version)}})
+                     (assoc op :type :ok))
+                 (assoc op :type :fail :error :precondition-failed))))
 
       (catch [:status 412] {} (assoc op
                                      :type  :fail
