@@ -1,6 +1,7 @@
 cluster-name = "restate-jepsen"
-bootstrap-num-partitions = 6
-log-filter = "restate_core::network::connection_manager=info,restate=debug"
+roles = ["metadata-store", "admin", "worker", "log-server"]
+bootstrap-num-partitions = 3
+log-filter = "restate_core::network::connection_manager=info,restate_metadata_store::omnipaxos=debug,restate_admin::metadata_api=trace,restate=debug"
 log-format = "compact"
 rocksdb-total-memory-size = "100 MB"
 
@@ -8,9 +9,11 @@ rocksdb-total-memory-size = "100 MB"
 heartbeat-interval = "1s"
 default-replication-strategy = "on-all-nodes"
 
+[metadata-store]
+type = "omnipaxos"
+
 [metadata-store-client]
-#type = "embedded"
-#address = "http://127.0.0.1:5122/"
+#addresses = ["http://n1:5122/", "http://n2:5122/", "http://n3:5122/"]
 
 [bifrost]
 default-provider = "replicated"

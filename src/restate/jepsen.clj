@@ -21,9 +21,7 @@
 
 (def resources-relative-path ".")
 (def server-restate-root "/opt/restate/")
-(def server-restate-binary "restate-server")
 (def server-logfile (str server-restate-root "/restate.log"))
-(def server-pidfile (str server-restate-root "/restate.pid"))
 (def server-services-dir "/opt/services/")
 (def node-binary "/usr/bin/node")
 (def services-args (str server-services-dir "services.js"))
@@ -61,12 +59,7 @@
          (c/upload (str resources-relative-path "/config/config.toml") "/opt/config.toml")
          (let [node-name (str "n" (inc (.indexOf (:nodes test) node)))
                node-id (inc (.indexOf (:nodes test) node))
-               metadata-store-address (str "http://" (first (:nodes test)) ":5122")]
-           (info "Starting node `" node-name "` with: "
-                 :--node-name (str "n" (inc (.indexOf (:nodes test) node)))
-                 :--force-node-id node-id
-                 :--allow-bootstrap (if (= node (first (:nodes test))) "true" "false")
-                 :--metadata-store-address metadata-store-address)
+               metadata-store-address-list (str "[" (str/join "," (map (fn [n] (str "http://" n ":5122")) (:nodes test))) "]")]
            (c/exec
             :docker
             :run
@@ -76,37 +69,51 @@
             :--detach
             :--volume "/opt/config.toml:/config.toml"
             :--volume "/opt/restate/restate-data:/restate-data"
-            :--env (str "RESTATE_METADATA_STORE_CLIENT__ADDRESS=" metadata-store-address)
-            :--env (str "RESTATE_ADVERTISED_ADDRESS=" (str "http://" node ":5122"))
+            :--env (str "RESTATE_METADATA_STORE_CLIENT__ADDRESSES=" metadata-store-address-list)
+            :--env (str "RESTATE_ADVERTISED_ADDRESS=http://" node ":5122")
+            :--env "DO_NOT_TRACK=true"
             (:image test)
             :--node-name node-name
             :--force-node-id node-id
             :--allow-bootstrap (if (= node (first (:nodes test))) "true" "false")
             :--auto-provision-partitions (if (= node (first (:nodes test))) "true" "false")
             :--config-file "/config.toml"
-            :--roles (str
-                      (if (= node (first (:nodes test))) "admin,metadata-store," nil)
-                      "worker,log-server,http-ingress")
-          ;; :--metadata-store-address metadata-store-address ;; TODO: this doesn't seem to have an effect
-          ;; :--advertise-address (str "http://" node ":5122") ;; TODO: this doesn't seem to have an effect
+            ;; :--metadata-store-address metadata-store-address ;; TODO: this doesn't seem to have an effect
+            ;; :--advertise-address (str "http://" node ":5122") ;; TODO: this doesn't seem to have an effect
             ))
-         (cu/await-tcp-port 8080)
+         (cu/await-tcp-port 9070)
 
          (when (= node (first (:nodes test)))
            (info "Registering Restate service on first node")
-           (cu/await-tcp-port 9070)
-           (c/exec :npx "@restatedev/restate" :deployments :register "http://host.docker.internal:9080" :--yes)))))
+           (c/exec :npx "@restatedev/restate" :deployments :register "http://host.docker.internal:9080" :--yes))
+
+         ;; HACK! make ourselves a candidate by positional index; timing-dependent and flaky
+         (let [node-idx (.indexOf (:nodes test) node)]
+           (when (not= node-idx 0)
+             (info "Marking ourselves a MDS OP node set candidate member ->" node-idx)
+             (Thread/sleep (* 1000 node-idx))
+             ;; restatectl metadata patch --key nodes_config --patch '[{ "op": "replace", "path": "/nodes/${node_index}/1/Node/metadata_server_config/metadata_server_state", "value": "candidate" }]'
+             (c/exec :docker :exec :restate :restatectl :metadata :patch
+                     "--key" "nodes_config"
+                     "--patch" (str "[{ \"op\": \"replace\", \"path\": \"/nodes/" node-idx
+                                    "/1/Node/metadata_server_config/metadata_server_state\", \"value\": \"candidate\" }]"))))
+
+          ;; TODO: replace with wait-for-healthy, not just listening
+         (cu/await-tcp-port 8080))))
 
     (teardown! [_this test node]
       (when (not (:dummy? (:ssh test)))
         (info node "Tearing down Restate")
         (c/su
-         (cu/stop-daemon! server-restate-binary server-pidfile)
          (c/exec :rm :-rf server-restate-root)
          (c/exec :rm :-rf server-services-dir)
+         (c/exec :docker :rm :-f "restate")
          (cu/stop-daemon! node-binary services-pidfile))))
 
-    db/LogFiles (log-files [_this _test _node] [server-logfile services-logfile])))
+    db/LogFiles (log-files [_this _test _node]
+                  (c/su (c/exec :docker :logs "restate" :> server-logfile)
+                        (c/exec :chmod :644 server-logfile))
+                  [server-logfile services-logfile])))
 
 (defn parse-long-nil
   "Parses a string to a Long. Passes through `nil`."
@@ -114,29 +121,29 @@
   (when s (parse-long s)))
 
 (defrecord
- RegisterServiceClient [ingress-url] client/Client
+ RegisterServiceClient [] client/Client
 
  (setup! [_this _test])
 
  (open! [this _test node] (assoc this :ingress-url (str "http://" node ":8080")))
 
- (invoke! [_client _test op]
+ (invoke! [this _test op]
    (let [[k v] (:value op)]
      (try+
       (case (:f op)
         :read (let [value
-                    (->> (http/get (str ingress-url "/Register/" k "/get"))
+                    (->> (http/get (str (:ingress-url this) "/Register/" k "/get"))
                          (:body)
                          (parse-long-nil))]
                 (assoc op :type :ok, :value (independent/tuple k value)))
 
-        :write (do (http/post (str ingress-url "/Register/" k "/set")
+        :write (do (http/post (str (:ingress-url this) "/Register/" k "/set")
                               {:body (json/generate-string v)
                                :content-type :json})
                    (assoc op :type :ok))
 
         :cas (let [[old new] v]
-               (http/post (str ingress-url "/Register/" k "/cas")
+               (http/post (str (:ingress-url this) "/Register/" k "/cas")
                           {:body (json/generate-string {:expected old :newValue new})
                            :content-type :json})
                (assoc op :type :ok)))
@@ -159,7 +166,7 @@
  (close! [_this _test]))
 
 (defrecord
- MetadataStoreServiceClient [admin-api] client/Client
+ MetadataStoreServiceClient [] client/Client
 
  (setup! [_this _test])
 
@@ -171,14 +178,14 @@
    (let [[k v] (:value op)]
      (try+
       (case (:f op)
-        :read (try+ (let [value (->> (http/get (str admin-api "/metadata/" k))
+        :read (try+ (let [value (->> (http/get (str (:admin-api this) "/metadata/" k))
                                      (:body)
                                      (parse-long-nil))]
                       (assoc op :type :ok, :value (independent/tuple k value)))
                     (catch [:status 404] _
                       (assoc op :type :ok, :value (independent/tuple k nil))))
         :write (do
-                 (http/put (str admin-api "/metadata/" k)
+                 (http/put (str (:admin-api this) "/metadata/" k)
                            {:body (json/generate-string v)
                             :headers {:If-Match "*"
                                       :ETag (bit-shift-left (abs (.nextInt (:random this))) 1)}
@@ -188,12 +195,12 @@
         :cas (let [[expected-value new-value] v
                    [stored-value stored-version]
                    (try+
-                    (let [res (http/get (str admin-api "/metadata/" k))]
+                    (let [res (http/get (str (:admin-api this) "/metadata/" k))]
                       [(parse-long-nil (:body res)) (parse-long-nil (->> res (:headers) (:ETag)))])
                     (catch [:status 404] {} [nil nil]))]
 
                (if (= stored-value expected-value)
-                 (do (http/put (str admin-api "/metadata/" k)
+                 (do (http/put (str (:admin-api this) "/metadata/" k)
                                {:body (json/generate-string new-value)
                                 :content-type :json
                                 :headers {:If-Match stored-version
@@ -208,6 +215,14 @@
       (catch [:status 404] {} (assoc op
                                      :type  :ok
                                      :value nil))
+
+      (catch [:status 500] {} (assoc op
+                                     :type  :fail
+                                     :error :server-internal))
+
+      (catch java.net.ConnectException {} (assoc op
+                                                 :type  :fail
+                                                 :error :timeout))
 
       (catch Object _ ((info (:throwable &throw-context) "Unhandled exception")
                        (assoc op
@@ -225,7 +240,7 @@
 (defn register-workload
   "Linearizable reads, writes, and compare-and-set operations on independent keys."
   [opts]
-  {:client    (RegisterServiceClient. nil)
+  {:client    (RegisterServiceClient.)
    :checker   (independent/checker
                (checker/compose
                 {:linear   (checker/linearizable {:model     (model/cas-register)
@@ -241,7 +256,7 @@
 (defn register-mds-workload
   "Linearizable reads, writes, and compare-and-set operations on independent keys."
   [opts]
-  {:client    (MetadataStoreServiceClient. nil)
+  {:client    (MetadataStoreServiceClient.)
    :checker   (independent/checker
                (checker/compose
                 {:linear   (checker/linearizable {:model     (model/cas-register)
