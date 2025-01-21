@@ -15,6 +15,7 @@
    [jepsen.control.util :as cu]
    [jepsen.os.debian :as debian]
    [clj-http.client :as http]
+   [clj-http.conn-mgr :as conn-mgr]
    [cheshire.core :as json]
    [slingshot.slingshot :refer [try+]]
    [knossos.model :as model]))
@@ -121,7 +122,7 @@
   (when s (parse-long s)))
 
 (defrecord
- RegisterServiceClient [] client/Client
+ RegisterServiceClient [conn-mgr] client/Client
 
  (setup! [_this _test])
 
@@ -132,20 +133,23 @@
      (try+
       (case (:f op)
         :read (let [value
-                    (->> (http/get (str (:ingress-url this) "/Register/" k "/get"))
+                    (->> (http/get (str (:ingress-url this) "/Register/" k "/get")
+                                   {:connection-manager conn-mgr})
                          (:body)
                          (parse-long-nil))]
                 (assoc op :type :ok, :value (independent/tuple k value)))
 
         :write (do (http/post (str (:ingress-url this) "/Register/" k "/set")
                               {:body (json/generate-string v)
-                               :content-type :json})
+                               :content-type :json
+                               :connection-manager conn-mgr})
                    (assoc op :type :ok))
 
         :cas (let [[old new] v]
                (http/post (str (:ingress-url this) "/Register/" k "/cas")
                           {:body (json/generate-string {:expected old :newValue new})
-                           :content-type :json})
+                           :content-type :json
+                           :connection-manager conn-mgr})
                (assoc op :type :ok)))
 
       (catch [:status 412] {} (assoc op
@@ -158,6 +162,14 @@
                                      :type  :fail
                                      :error :not-found))
 
+      (catch [:status 500] {} (assoc op
+                                     :type  :fail
+                                     :error :server-internal))
+
+      (catch java.net.ConnectException {} (assoc op
+                                                 :type  :fail
+                                                 :error :timeout))
+
       (catch Object {} (assoc op
                               :type  :fail)))))
 
@@ -166,7 +178,7 @@
  (close! [_this _test]))
 
 (defrecord
- MetadataStoreServiceClient [] client/Client
+ MetadataStoreServiceClient [conn-mgr] client/Client
 
  (setup! [_this _test])
 
@@ -178,7 +190,8 @@
    (let [[k v] (:value op)]
      (try+
       (case (:f op)
-        :read (try+ (let [value (->> (http/get (str (:admin-api this) "/metadata/" k))
+        :read (try+ (let [value (->> (http/get (str (:admin-api this) "/metadata/" k)
+                                               {:connection-manager conn-mgr})
                                      (:body)
                                      (parse-long-nil))]
                       (assoc op :type :ok, :value (independent/tuple k value)))
@@ -189,22 +202,25 @@
                            {:body (json/generate-string v)
                             :headers {:If-Match "*"
                                       :ETag (bit-shift-left (abs (.nextInt (:random this))) 1)}
-                            :content-type :json})
+                            :content-type :json
+                            :connection-manager conn-mgr})
                  (assoc op :type :ok))
 
         :cas (let [[expected-value new-value] v
                    [stored-value stored-version]
                    (try+
-                    (let [res (http/get (str (:admin-api this) "/metadata/" k))]
+                    (let [res (http/get (str (:admin-api this) "/metadata/" k)
+                                        {:connection-manager conn-mgr})]
                       [(parse-long-nil (:body res)) (parse-long-nil (->> res (:headers) (:ETag)))])
                     (catch [:status 404] {} [nil nil]))]
 
                (if (= stored-value expected-value)
                  (do (http/put (str (:admin-api this) "/metadata/" k)
                                {:body (json/generate-string new-value)
-                                :content-type :json
                                 :headers {:If-Match stored-version
-                                          :ETag (inc stored-version)}})
+                                          :ETag (inc stored-version)}
+                                :content-type :json
+                                :connection-manager conn-mgr})
                      (assoc op :type :ok))
                  (assoc op :type :fail :error :precondition-failed))))
 
@@ -237,10 +253,16 @@
 (defn w   [_ _] {:type :invoke, :f :write, :value (rand-int 5)})
 (defn cas [_ _] {:type :invoke, :f :cas,   :value [(rand-int 5) (rand-int 5)]})
 
+(defn http-connection-manager [& opts]
+  (conn-mgr/make-reusable-conn-manager
+   (merge opts {:timeout 2
+                :default-per-route 20
+                :threads 100})))
+
 (defn register-workload
   "Linearizable reads, writes, and compare-and-set operations on independent keys."
   [opts]
-  {:client    (RegisterServiceClient.)
+  {:client    (RegisterServiceClient. (http-connection-manager))
    :checker   (independent/checker
                (checker/compose
                 {:linear   (checker/linearizable {:model     (model/cas-register)
@@ -256,7 +278,7 @@
 (defn register-mds-workload
   "Linearizable reads, writes, and compare-and-set operations on independent keys."
   [opts]
-  {:client    (MetadataStoreServiceClient.)
+  {:client    (MetadataStoreServiceClient. (http-connection-manager))
    :checker   (independent/checker
                (checker/compose
                 {:linear   (checker/linearizable {:model     (model/cas-register)
