@@ -1,7 +1,7 @@
 cluster-name = "restate-jepsen"
 roles = ["metadata-store", "admin", "worker", "log-server"]
-bootstrap-num-partitions = 3
-log-filter = "restate_core::network::connection_manager=info,restate_metadata_store::omnipaxos=trace,restate_admin::metadata_api=trace,restate=debug"
+log-filter = "restate_core::network::connection_manager=info,restate_metadata_store::omnipaxos=debug,restate_admin::metadata_api=debug,restate=debug"
+#log-filter = "restate_core::network::connection_manager=info,restate_metadata_store::omnipaxos=trace,restate_admin::metadata_api=trace,restate=trace"
 log-format = "compact"
 rocksdb-total-memory-size = "100 MB"
 

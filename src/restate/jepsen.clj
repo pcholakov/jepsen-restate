@@ -1,6 +1,7 @@
 (ns restate.jepsen
   (:require
    [clojure.tools.logging :refer [info]]
+   [clojure.math :as m]
    [clojure.string :as str]
    [jepsen
     [checker :as checker]
@@ -11,7 +12,8 @@
     [generator :as gen]
     [independent :as independent]
     [nemesis :as nemesis]
-    [tests :as tests]]
+    [tests :as tests]
+    [util :as util]]
    [jepsen.checker.timeline :as timeline]
    [jepsen.control.util :as cu]
    [jepsen.os.debian :as debian]
@@ -30,15 +32,23 @@
 (def services-pidfile (str server-services-dir "services.pid"))
 (def services-logfile (str server-services-dir "services.log"))
 
+(defn get-nodes-count []
+  (-> (c/exec :docker :exec :restate  :restatectl :meta :get :-k "nodes_config" :| :jq ".nodes | length")
+      Integer/parseInt))
+
+(defn wait-for-nodes [expected-count]
+  (util/await-fn
+   (fn [] (when (= (get-nodes-count) expected-count) true))))
+
 (defn restate
   "A deployment of Restate along with the required test services."
-  []
+  [opts]
   (reify db/DB
     (setup! [_db test node]
       (when (not (:dummy? (:ssh test)))
         (info node "Setting up Restate")
         (c/su
-         (c/exec :apt :install :-y :docker.io :nodejs :npm)
+         (c/exec :apt :install :-y :docker.io :nodejs :jq)
 
          (c/exec :mkdir :-p "/opt/services")
          (c/upload (str resources-relative-path "/services/dist/services.zip") "/opt/services.zip")
@@ -71,6 +81,7 @@
             :--detach
             :--volume "/opt/config.toml:/config.toml"
             :--volume "/opt/restate/restate-data:/restate-data"
+            :--env (str "RESTATE_BOOTSTRAP_NUM_PARTITIONS=" (:num-partitions opts))
             :--env (str "RESTATE_METADATA_STORE_CLIENT__ADDRESSES=" metadata-store-address-list)
             :--env (str "RESTATE_ADVERTISED_ADDRESS=http://" node ":5122")
             :--env "DO_NOT_TRACK=true"
@@ -85,9 +96,23 @@
             ))
          (cu/await-tcp-port 9070)
 
+         (info "Waiting for all nodes to join cluster")
+         (wait-for-nodes (count (:nodes test)))
+
          (when (= node (first (:nodes test)))
-           (info "Registering Restate service on first node")
-           (c/exec :npx "@restatedev/restate" :deployments :register "http://host.docker.internal:9080" :--yes))
+           (info "Performing once-off setup")
+           (c/exec :docker :exec :restate :restate :deployments :register "http://host.docker.internal:9080" :--yes)
+
+           (when (> (count (:nodes test)) 2)
+             (let [replication-factor (int (+ 1 (m/floor (/ (count (:nodes test)) 2))))]
+               (info "Reconfiguring all logs with replication factor:" replication-factor)
+               (doseq [log-id (range (:num-partitions opts))]
+                 (info "Exec:" :docker :exec :restate :restatectl :logs :reconfigure
+                       :--log-id log-id :--provider :replicated
+                       :--replication-factor-nodes replication-factor)
+                 (c/exec :docker :exec :restate :restatectl :logs :reconfigure
+                         :--log-id log-id :--provider :replicated
+                         :--replication-factor-nodes replication-factor)))))
 
          ;; HACK! make ourselves a candidate by positional index; timing-dependent and flaky
          (let [node-idx (.indexOf (:nodes test) node)]
@@ -96,11 +121,11 @@
              (Thread/sleep (* 1000 node-idx))
              ;; restatectl metadata patch --key nodes_config --patch '[{ "op": "replace", "path": "/nodes/${node_index}/1/Node/metadata_server_config/metadata_server_state", "value": "candidate" }]'
              (c/exec :docker :exec :restate :restatectl :metadata :patch
-                     "--key" "nodes_config"
-                     "--patch" (str "[{ \"op\": \"replace\", \"path\": \"/nodes/" node-idx
-                                    "/1/Node/metadata_server_config/metadata_server_state\", \"value\": \"candidate\" }]"))))
+                     :--key "nodes_config"
+                     :--patch (str "[{ \"op\": \"replace\", \"path\": \"/nodes/" node-idx
+                                   "/1/Node/metadata_server_config/metadata_server_state\", \"value\": \"candidate\" }]"))))
 
-          ;; TODO: replace with wait-for-healthy, not just listening
+         ;; TODO: replace with wait-for-healthy, not just listening
          (cu/await-tcp-port 8080))))
 
     (teardown! [_this test node]
@@ -300,7 +325,7 @@
            (if (not (:dummy? (:ssh opts))) {:os debian/os} nil)
            {:pure-generators true
             :name            (str "restate-" (name (:workload opts)))
-            :db              (restate)
+            :db              (restate {:num-partitions 3})
             :client          (:client workload)
             :nemesis         (nemesis/node-start-stopper rand-nth
                                                          (fn start [_t _n]
