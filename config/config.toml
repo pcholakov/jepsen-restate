@@ -10,7 +10,7 @@ heartbeat-interval = "1s"
 default-replication-strategy = "on-all-nodes"
 
 [metadata-store]
-type = "omnipaxos"
+type = "raft"
 
 [metadata-store-client]
 #addresses = ["http://n1:5122/", "http://n2:5122/", "http://n3:5122/"]

@@ -36,9 +36,17 @@
   (-> (c/exec :docker :exec :restate  :restatectl :meta :get :-k "nodes_config" :| :jq ".nodes | length")
       Integer/parseInt))
 
+(defn get-logs-count []
+  (-> (c/exec :docker :exec :restate  :restatectl :meta :get :-k "bifrost_config" :| :jq ".logs | length")
+      Integer/parseInt))
+
 (defn wait-for-nodes [expected-count]
   (util/await-fn
    (fn [] (when (= (get-nodes-count) expected-count) true))))
+
+(defn wait-for-logs [expected-count]
+  (util/await-fn
+   (fn [] (when (= (get-logs-count) expected-count) true))))
 
 (defn restate
   "A deployment of Restate along with the required test services."
@@ -96,11 +104,18 @@
             ))
          (cu/await-tcp-port 9070)
 
-         (info "Waiting for all nodes to join cluster")
+         (info "Waiting for all nodes to join cluster and partitions to be confiured")
          (wait-for-nodes (count (:nodes test)))
+         (wait-for-logs (:num-partitions opts))
 
          (when (= node (first (:nodes test)))
            (info "Performing once-off setup")
+           (doseq [node-idx (range (count (:nodes test)))]
+             (c/exec :docker :exec :restate :restatectl :metadata :patch
+                     :--key "nodes_config"
+                     :--patch (str "[{ \"op\": \"replace\", \"path\": \"/nodes/" node-idx
+                                   "/1/Node/metadata_server_config/metadata_server_state\", \"value\": \"member\" }]")))
+
            (c/exec :docker :exec :restate :restate :deployments :register "http://host.docker.internal:9080" :--yes)
 
            (when (> (count (:nodes test)) 2)
@@ -113,17 +128,6 @@
                  (c/exec :docker :exec :restate :restatectl :logs :reconfigure
                          :--log-id log-id :--provider :replicated
                          :--replication-factor-nodes replication-factor)))))
-
-         ;; HACK! make ourselves a candidate by positional index; timing-dependent and flaky
-         (let [node-idx (.indexOf (:nodes test) node)]
-           (when (not= node-idx 0)
-             (info "Marking ourselves a MDS OP node set candidate member ->" node-idx)
-             (Thread/sleep (* 1000 node-idx))
-             ;; restatectl metadata patch --key nodes_config --patch '[{ "op": "replace", "path": "/nodes/${node_index}/1/Node/metadata_server_config/metadata_server_state", "value": "candidate" }]'
-             (c/exec :docker :exec :restate :restatectl :metadata :patch
-                     :--key "nodes_config"
-                     :--patch (str "[{ \"op\": \"replace\", \"path\": \"/nodes/" node-idx
-                                   "/1/Node/metadata_server_config/metadata_server_state\", \"value\": \"candidate\" }]"))))
 
          ;; TODO: replace with wait-for-healthy, not just listening
          (cu/await-tcp-port 8080))))
