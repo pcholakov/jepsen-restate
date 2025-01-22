@@ -1,6 +1,6 @@
 (ns restate.jepsen
   (:require
-   [clojure.tools.logging :refer :all]
+   [clojure.tools.logging :refer [info]]
    [clojure.string :as str]
    [jepsen
     [checker :as checker]
@@ -10,6 +10,7 @@
     [db :as db]
     [generator :as gen]
     [independent :as independent]
+    [nemesis :as nemesis]
     [tests :as tests]]
    [jepsen.checker.timeline :as timeline]
    [jepsen.control.util :as cu]
@@ -31,11 +32,11 @@
 
 (defn restate
   "A deployment of Restate along with the required test services."
-  [version]
+  []
   (reify db/DB
     (setup! [_db test node]
       (when (not (:dummy? (:ssh test)))
-        (info node "Setting up Restate Server" version "for testing")
+        (info node "Setting up Restate")
         (c/su
          (c/exec :apt :install :-y :docker.io :nodejs :npm)
 
@@ -126,7 +127,9 @@
 
  (setup! [_this _test])
 
- (open! [this _test node] (assoc this :ingress-url (str "http://" node ":8080")))
+ (open! [this test node] (assoc this
+                                :node (str "n" (inc (.indexOf (:nodes test) node)))
+                                :ingress-url (str "http://" node ":8080")))
 
  (invoke! [this _test op]
    (let [[k v] (:value op)]
@@ -137,41 +140,32 @@
                                    {:connection-manager conn-mgr})
                          (:body)
                          (parse-long-nil))]
-                (assoc op :type :ok, :value (independent/tuple k value)))
+                (assoc op :type :ok :value (independent/tuple k value) :node (:node this)))
 
         :write (do (http/post (str (:ingress-url this) "/Register/" k "/set")
                               {:body (json/generate-string v)
                                :content-type :json
                                :connection-manager conn-mgr})
-                   (assoc op :type :ok))
+                   (assoc op :type :ok :node (:node this)))
 
         :cas (let [[old new] v]
                (http/post (str (:ingress-url this) "/Register/" k "/cas")
                           {:body (json/generate-string {:expected old :newValue new})
                            :content-type :json
                            :connection-manager conn-mgr})
-               (assoc op :type :ok)))
+               (assoc op :type :ok :node (:node this))))
 
-      (catch [:status 412] {} (assoc op
-                                     :type  :fail
-                                     :error :precondition-failed))
+      (catch [:status 412] {} (assoc op :type :fail :error :precondition-failed :node (:node this)))
 
       ;; for the CAS service, a 404 means deployment hasn't yet completed -
       ;; this is likely replication latency
-      (catch [:status 404] {} (assoc op
-                                     :type  :fail
-                                     :error :not-found))
+      (catch [:status 404] {} (assoc op :type :fail :error :not-found :node (:node this)))
 
-      (catch [:status 500] {} (assoc op
-                                     :type  :fail
-                                     :error :server-internal))
+      (catch java.net.ConnectException {} (assoc op :type :fail :error :connect :node (:node this)))
 
-      (catch java.net.ConnectException {} (assoc op
-                                                 :type  :fail
-                                                 :error :timeout))
-
-      (catch Object {} (assoc op
-                              :type  :fail)))))
+      (catch [:status 500] {} (assoc op :type :info :info :server-internal :node (:node this)))
+      (catch java.net.SocketTimeoutException {} (assoc op :type :info :error :timeout :node (:node this)))
+      (catch java.lang.Error {} (assoc op :type :info)))))
 
  (teardown! [_this _test])
 
@@ -182,68 +176,64 @@
 
  (setup! [_this _test])
 
- (open! [this _test node] (assoc this
-                                 :admin-api (str "http://" node ":9070")
-                                 :random (new java.util.Random)))
+ (open! [this test node] (assoc this
+                                :node (str "n" (inc (.indexOf (:nodes test) node)))
+                                :admin-api (str "http://" node ":9070")
+                                :defaults {:connection-manager conn-mgr
+                                           :connection-timeout 200
+                                           :socket-timeout 500}
+                                :random (new java.util.Random)))
 
  (invoke! [this _test op]
    (let [[k v] (:value op)]
      (try+
       (case (:f op)
         :read (try+ (let [value (->> (http/get (str (:admin-api this) "/metadata/" k)
-                                               {:connection-manager conn-mgr})
+                                               (:defaults this))
                                      (:body)
                                      (parse-long-nil))]
-                      (assoc op :type :ok, :value (independent/tuple k value)))
-                    (catch [:status 404] _
-                      (assoc op :type :ok, :value (independent/tuple k nil))))
+                      (assoc op :type :ok :value (independent/tuple k value) :node (:node this)))
+                    (catch [:status 404] {}
+                      (assoc op :type :ok :value (independent/tuple k nil) :node (:node this))))
         :write (do
                  (http/put (str (:admin-api this) "/metadata/" k)
-                           {:body (json/generate-string v)
-                            :headers {:If-Match "*"
-                                      :ETag (bit-shift-left (abs (.nextInt (:random this))) 1)}
-                            :content-type :json
-                            :connection-manager conn-mgr})
-                 (assoc op :type :ok))
+                           (merge (:defaults this)
+                                  {:body (json/generate-string v)
+                                   :headers {:If-Match "*"
+                                             :ETag (bit-shift-left (abs (.nextInt (:random this))) 1)}
+                                   :content-type :json}))
+                 (assoc op :type :ok :node (:node this)))
 
         :cas (let [[expected-value new-value] v
                    [stored-value stored-version]
                    (try+
                     (let [res (http/get (str (:admin-api this) "/metadata/" k)
-                                        {:connection-manager conn-mgr})]
+                                        (:defaults this))]
                       [(parse-long-nil (:body res)) (parse-long-nil (->> res (:headers) (:ETag)))])
+                    ;; this key is unset
                     (catch [:status 404] {} [nil nil]))]
 
                (if (= stored-value expected-value)
                  (do (http/put (str (:admin-api this) "/metadata/" k)
-                               {:body (json/generate-string new-value)
-                                :headers {:If-Match stored-version
-                                          :ETag (inc stored-version)}
-                                :content-type :json
-                                :connection-manager conn-mgr})
-                     (assoc op :type :ok))
-                 (assoc op :type :fail :error :precondition-failed))))
+                               (merge (:defaults this)
+                                      {:body (json/generate-string new-value)
+                                       :headers {:If-Match stored-version
+                                                 :ETag (inc stored-version)}
+                                       :content-type :json}))
+                     (assoc op :type :ok :node (:node this)))
+                 (assoc op :type :fail :error :precondition-failed :node (:node this)))))
 
-      (catch [:status 412] {} (assoc op
-                                     :type  :fail
-                                     :error :precondition-failed))
+      (catch [:status 412] {} (assoc op :type :fail :error :precondition-failed :node (:node this)))
 
-      (catch [:status 404] {} (assoc op
-                                     :type  :ok
-                                     :value nil))
+      ;; the MDS API returns 404 for unset keys
+      (catch [:status 404] {} (assoc op :type :ok :value nil :node (:node this)))
 
-      (catch [:status 500] {} (assoc op
-                                     :type  :fail
-                                     :error :server-internal))
+      (catch java.net.ConnectException {} (assoc op :type :info :error :connect :node (:node this)))
 
-      (catch java.net.ConnectException {} (assoc op
-                                                 :type  :fail
-                                                 :error :timeout))
-
-      (catch Object _ ((info (:throwable &throw-context) "Unhandled exception")
-                       (assoc op
-                              :type  :fail
-                              :error :unhandled-exception))))))
+      ;; NB: :type :info events indicate that the effect on the system is uncertain
+      (catch [:status 500] {} (assoc op :type :info :error :server-internal :node (:node this)))
+      (catch java.net.SocketTimeoutException {} (assoc op :type :info :error :timeout :node (:node this)))
+      (catch java.lang.Exception {} (assoc op :type :info :error :unhandled-exception :node (:node this))))))
 
  (teardown! [_this _test])
 
@@ -310,16 +300,27 @@
            (if (not (:dummy? (:ssh opts))) {:os debian/os} nil)
            {:pure-generators true
             :name            (str "restate-" (name (:workload opts)))
-            :db              (restate "v1.1.6")
+            :db              (restate)
             :client          (:client workload)
-            :checker         (checker/compose
-                              {:perf     (checker/perf)
-                               :workload (:checker workload)})
+            :nemesis         (nemesis/node-start-stopper rand-nth
+                                                         (fn start [_t _n]
+                                                           (c/su (c/exec :docker :kill "restate"))
+                                                           [:paused "restate-server"])
+                                                         (fn stop [_t _n]
+                                                           (c/su (c/exec :docker :start "restate"))
+                                                           [:resumed "restate-server"]))
             :generator       (gen/phases
                               (->> (:generator workload)
                                    (gen/stagger (/ (:rate opts)))
+                                   (gen/nemesis (cycle [(gen/sleep 5)
+                                                        {:type :info, :f :start}
+                                                        (gen/sleep 5)
+                                                        {:type :info, :f :stop}]))
                                    (gen/time-limit (:time-limit opts)))
-                              (gen/clients (:final-generator workload)))}
+                              (gen/clients (:final-generator workload)))
+            :checker         (checker/compose
+                              {:perf     (checker/perf)
+                               :workload (:checker workload)})}
            {:client  (:client workload)
             :checker (:checker workload)})))
 
