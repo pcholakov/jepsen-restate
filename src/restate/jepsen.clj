@@ -110,11 +110,17 @@
 
          (when (= node (first (:nodes test)))
            (info "Performing once-off setup")
-           (doseq [node-idx (range (count (:nodes test)))]
-             (c/exec :docker :exec :restate :restatectl :metadata :patch
-                     :--key "nodes_config"
-                     :--patch (str "[{ \"op\": \"replace\", \"path\": \"/nodes/" node-idx
-                                   "/1/Node/metadata_server_config/metadata_server_state\", \"value\": \"member\" }]")))
+
+           (c/exec :docker :exec :restate :restatectl :metadata :patch
+                   :--key "nodes_config" :--patch
+                   (str "["
+                        (str/join ","
+                                  (for [node-idx (range (count (:nodes test)))]
+                                    (str "{\"op\": \"replace\", \"path\": \"/nodes/" node-idx
+                                         "/1/Node/metadata_server_config/metadata_server_state\", \"value\": \"member\"}")))
+                        "]"))
+
+           (info "Patched nodes configuration:" (c/exec :docker :exec :restate :restatectl :metadata :get :-k "nodes_config"))
 
            (c/exec :docker :exec :restate :restate :deployments :register "http://host.docker.internal:9080" :--yes)
 
@@ -341,7 +347,7 @@
             :generator       (gen/phases
                               (->> (:generator workload)
                                    (gen/stagger (/ (:rate opts)))
-                                   (gen/nemesis (cycle [(gen/sleep 5)
+                                   (gen/nemesis (cycle [(gen/sleep 10)
                                                         {:type :info, :f :start}
                                                         (gen/sleep 5)
                                                         {:type :info, :f :stop}]))
