@@ -104,8 +104,7 @@
             ))
          (cu/await-tcp-port 9070)
 
-         (info "Waiting for all nodes to join cluster and partitions to be confiured")
-         (wait-for-nodes (count (:nodes test)))
+         (info "Waiting for all nodes to join cluster and partitions to be configured")
          (wait-for-logs (:num-partitions opts))
 
          (when (= node (first (:nodes test)))
@@ -148,7 +147,7 @@
          (cu/stop-daemon! node-binary services-pidfile))))
 
     db/LogFiles (log-files [_this _test _node]
-                  (c/su (c/exec :docker :logs "restate" :> server-logfile)
+                  (c/su (c/exec* "docker logs restate" "&>" server-logfile)
                         (c/exec :chmod :644 server-logfile))
                   [server-logfile services-logfile])))
 
