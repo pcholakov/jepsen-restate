@@ -21,7 +21,8 @@
    [clj-http.conn-mgr :as conn-mgr]
    [cheshire.core :as json]
    [slingshot.slingshot :refer [try+]]
-   [knossos.model :as model]))
+   [knossos.model :as model]
+   [restate.jepsen.set :as mds-set]))
 
 (def resources-relative-path ".")
 (def server-restate-root "/opt/restate/")
@@ -146,10 +147,11 @@
          (c/exec :docker :rm :-f "restate")
          (cu/stop-daemon! node-binary services-pidfile))))
 
-    db/LogFiles (log-files [_this _test _node]
-                  (c/su (c/exec* "docker logs restate" "&>" server-logfile)
-                        (c/exec :chmod :644 server-logfile))
-                  [server-logfile services-logfile])))
+    db/LogFiles (log-files [_this test _node]
+                  (when (not (:dummy? (:ssh test)))
+                    (c/su (c/exec* "docker logs restate" "&>" server-logfile)
+                          (c/exec :chmod :644 server-logfile))
+                    [server-logfile services-logfile]))))
 
 (defn parse-long-nil
   "Parses a string to a Long. Passes through `nil`."
@@ -199,7 +201,7 @@
 
       (catch [:status 500] {} (assoc op :type :info :info :server-internal :node (:node this)))
       (catch java.net.SocketTimeoutException {} (assoc op :type :info :error :timeout :node (:node this)))
-      (catch java.lang.Error {} (assoc op :type :info)))))
+      (catch Object {} (assoc op :type :info)))))
 
  (teardown! [_this _test])
 
@@ -214,8 +216,8 @@
                                 :node (str "n" (inc (.indexOf (:nodes test) node)))
                                 :admin-api (str "http://" node ":9070")
                                 :defaults {:connection-manager conn-mgr
-                                           :connection-timeout 200
-                                           :socket-timeout 500}
+                                           :connection-timeout 500
+                                           :socket-timeout 1000}
                                 :random (new java.util.Random)))
 
  (invoke! [this _test op]
@@ -267,7 +269,7 @@
       ;; NB: :type :info events indicate that the effect on the system is uncertain
       (catch [:status 500] {} (assoc op :type :info :error :server-internal :node (:node this)))
       (catch java.net.SocketTimeoutException {} (assoc op :type :info :error :timeout :node (:node this)))
-      (catch java.lang.Exception {} (assoc op :type :info :error :unhandled-exception :node (:node this))))))
+      (catch Object {} (assoc op :type :info :error :unhandled-exception :node (:node this))))))
 
  (teardown! [_this _test])
 
@@ -318,7 +320,8 @@
 (def workloads
   "A map of workload names to functions that construct workloads, given opts."
   {"register" register-workload
-   "register-mds" register-mds-workload})
+   "register-mds" register-mds-workload
+   "set-mds" mds-set/workload})
 
 (defn restate-test
   "Given an options map from the command line runner (e.g. :nodes, :ssh,
@@ -346,17 +349,21 @@
             :generator       (gen/phases
                               (->> (:generator workload)
                                    (gen/stagger (/ (:rate opts)))
-                                   (gen/nemesis (cycle [(gen/sleep 10)
+                                   (gen/nemesis (cycle [(gen/sleep 5)
                                                         {:type :info, :f :start}
                                                         (gen/sleep 5)
                                                         {:type :info, :f :stop}]))
                                    (gen/time-limit (:time-limit opts)))
-                              (gen/clients (:final-generator workload)))
+                              (gen/nemesis [{:type :info, :f :stop}])
+                              (->>
+                               (gen/clients (:generator workload))
+                               (gen/stagger (/ (:rate opts)))
+                               (gen/time-limit 5)))
             :checker         (checker/compose
-                              {:perf     (checker/perf)
-                               :workload (:checker workload)})}
-           {:client  (:client workload)
-            :checker (:checker workload)})))
+                              {:perf       (checker/perf)
+                               :stats      (checker/stats)
+                               :exceptions (checker/unhandled-exceptions)
+                               :workload   (:checker workload)})})))
 
 (def cli-opts
   "Additional command line options."

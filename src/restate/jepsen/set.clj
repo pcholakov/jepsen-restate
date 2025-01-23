@@ -1,50 +1,77 @@
 (ns restate.jepsen.set
-  (:require [jepsen
+  (:require [jepsen [client :as client]
              [checker :as checker]
-             [client :as client]
              [generator :as gen]]
-            [jepsen.etcdemo.support :as s]
-            [slingshot.slingshot :refer [try+]]
-            [verschlimmbesserung.core :as v]))
+            [clj-http.client :as http]
+            [clj-http.conn-mgr :as conn-mgr]
+            [cheshire.core :as json]
+            [slingshot.slingshot :refer [try+]]))
 
-(defrecord SetClient [k conn]
-  client/Client
-  (open! [this test node]
-    (assoc this :conn (v/connect (s/client-url node)
-                                 {:timeout 5000})))
+(defrecord
+ SetClient [key conn-mgr] client/Client
 
-  (setup! [this test]
-    (v/reset! conn k "#{}"))
+ (open! [this test node]
+   (assoc this
+          :node (str "n" (inc (.indexOf (:nodes test) node)))
+          :endpoint (str "http://" node ":9070/metadata/")
+          :defaults {:connection-manager
+                     (conn-mgr/make-reusable-conn-manager
+                      {:timeout 2 :default-per-route 20 :threads 100})
+                     :connection-timeout 500
+                     :socket-timeout 1000}
+          :random (new java.util.Random)))
 
-  (invoke! [_ test op]
-    (try+
-     (case (:f op)
-       :read (assoc op
-                    :type :ok
-                    :value (read-string
-                            (v/get conn k {:quorum? (:quorum test)})))
+ (setup! [this _test]
+   (http/put (str (:endpoint this) key)
+             (merge (:defaults this)
+                    (merge (:defaults this)
+                           {:body (json/generate-string #{})
+                            :headers {:If-Match "*" :ETag 1}
+                            :content-type :json}))))
 
-       :add (do (v/swap! conn k (fn [value]
-                                  (-> value
-                                      read-string
-                                      (conj (:value op))
-                                      pr-str)))
-                (assoc op :type :ok)))
+ (invoke! [this _test op]
+   (case (:f op)
+     :read (assoc op
+                  :type :ok,
+                  :value (->> (http/get (str (:endpoint this) key)
+                                        (:defaults this))
+                              (:body)
+                              (json/parse-string)
+                              set))
 
-     (catch java.net.SocketTimeoutException e
-       (assoc op
-              :type  (if (= :read (:f op)) :fail :info)
-              :error :timeout))))
+     :add (try+
+           (let [[new-set stored-version]
+                 (let [res (http/get (str (:endpoint this) key)
+                                     (:defaults this))]
+                   [(conj (->> (json/parse-string (:body res)) set) (:value op))
+                    (parse-long (->> res (:headers) (:ETag)))])]
+             (http/put (str (:endpoint this) key)
+                       (merge (:defaults this)
+                              {:body (json/generate-string new-set)
+                               :headers {:If-Match stored-version
+                                         :ETag (inc stored-version)}
+                               :content-type :json}))
+             (assoc op :type :ok))
+           (catch [:status 412] {} (assoc op :type :fail :error :precondition-failed :node (:node this)))
+           (catch java.net.SocketTimeoutException {} (assoc op :type :info :error :timeout :node (:node this)))
+           (catch Object {} (assoc op :type :info :error :unhandled-exception :node (:node this))))))
 
-  (teardown! [_ test])
+ (teardown! [_ _test])
 
-  (close! [_ test]))
+ (close! [_ _test]))
+
+(defn w
+  []
+  (->> (range)
+       (map (fn [x] {:type :invoke, :f :add, :value x}))))
+
+(defn r
+  []
+  {:type :invoke, :f :read, :value nil})
 
 (defn workload
   "A generator, client, and checker for a set test."
   [opts]
-  {:client    (SetClient. "a-set" nil)
-   :checker   (checker/set)
-   :generator (->> (range)
-                   (map (fn [x] {:type :invoke, :f :add :value x})))
-   :final-generator (gen/once {:type :invoke, :f :read, :value nil})})
+  {:client    (SetClient. "jepsen-set" (:http-connection-manager opts))
+   :checker   (checker/set-full {:linearizable? true})
+   :generator (gen/reserve 5 (repeat (r)) (w))})
