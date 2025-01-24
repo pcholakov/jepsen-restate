@@ -318,10 +318,23 @@
                       (gen/limit (:ops-per-key opts)))))})
 
 (def workloads
-  "A map of workload names to functions that construct workloads, given opts."
+  "A map of workloads."
   {"register" register-workload
    "register-mds" register-mds-workload
    "set-mds" mds-set/workload})
+
+(def nemeses
+  "A map of nemeses."
+  {"none" nil
+   "container-killer"      (nemesis/node-start-stopper
+                            rand-nth
+                            (fn start [_t _n]
+                              (c/su (c/exec :docker :kill :-s :KILL "restate"))
+                              [:killed "restate-server"])
+                            (fn stop [_t _n]
+                              (c/su (c/exec :docker :start "restate"))
+                              [:restarted "restate-server"]))
+   "partition-random-node" (nemesis/partition-random-node)})
 
 (defn restate-test
   "Given an options map from the command line runner (e.g. :nodes, :ssh,
@@ -329,7 +342,8 @@
 
       :rate         Approximate number of requests per second, per thread
       :ops-per-key  Maximum number of operations allowed on any given key.
-      :workload     Type of workload."
+      :workload     Type of workload.
+      :nemesis      Nemesis to apply."
   [opts]
   (let [workload ((get workloads (:workload opts)) opts)]
     (merge tests/noop-test
@@ -339,13 +353,7 @@
             :name            (str "restate-" (name (:workload opts)))
             :db              (restate {:num-partitions 3})
             :client          (:client workload)
-            :nemesis         (nemesis/node-start-stopper rand-nth
-                                                         (fn start [_t _n]
-                                                           (c/su (c/exec :docker :kill "restate"))
-                                                           [:paused "restate-server"])
-                                                         (fn stop [_t _n]
-                                                           (c/su (c/exec :docker :start "restate"))
-                                                           [:resumed "restate-server"]))
+            :nemesis         (get nemeses (:nemesis opts))
             :generator       (gen/phases
                               (->> (:generator workload)
                                    (gen/stagger (/ (:rate opts)))
@@ -372,6 +380,9 @@
    [nil "--image-tarball STRING" "Restate container local path"]
    ["-w" "--workload NAME" "Workload to run"
     :missing  (str "--workload " (cli/one-of workloads))
+    :validate (workloads (cli/one-of workloads))]
+   ["-N" "--nemesis NAME" "Nemesis to apply"
+    :default "none"
     :validate (workloads (cli/one-of workloads))]
    ["-r" "--rate HZ" "Approximate number of requests per second, per thread."
     :default  10
