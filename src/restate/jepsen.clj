@@ -77,6 +77,8 @@
             :--env (str "RESTATE_BOOTSTRAP_NUM_PARTITIONS=" (:num-partitions opts))
             :--env (str "RESTATE_METADATA_STORE_CLIENT__ADDRESSES=" metadata-store-address-list)
             :--env (str "RESTATE_ADVERTISED_ADDRESS=http://" node ":5122")
+            :--env (str "RESTATE_BIFROST__REPLICATED_LOGLET__DEFAULT_REPLICATION_PROPERTY={node: "
+                        (->> (/ (count (:nodes test)) 2) m/floor int inc) "}")
             :--env "DO_NOT_TRACK=true"
             (:image test)
             :--node-name node-name
@@ -98,13 +100,14 @@
          (when (= node (first (:nodes test)))
            (info "Performing once-off setup")
            (ru/restate :deployments :register "http://host.docker.internal:9080" :--yes)
-           (when (> (count (:nodes test)) 2)
-             (let [replication-factor (int (+ 1 (m/floor (/ (count (:nodes test)) 2))))]
-               (info "Reconfiguring all logs with replication factor:" replication-factor)
-               (doseq [log-id (range (:num-partitions opts))]
-                 (ru/restatectl :logs :reconfigure
-                                :--log-id log-id :--provider :replicated
-                                :--replication-factor-nodes replication-factor)))))
+            ;; (when (> (count (:nodes test)) 2)
+            ;;   (let [replication-factor (int (+ 1 (m/floor (/ (count (:nodes test)) 2))))]
+            ;;     (info "Reconfiguring all logs with replication factor:" replication-factor)
+            ;;     (doseq [log-id (range (:num-partitions opts))]
+            ;;       (ru/restatectl :logs :reconfigure
+            ;;                      :--log-id log-id :--provider :replicated
+            ;;                      :--replication-factor-nodes replication-factor))))
+           )
 
          (info "Waiting for service deployment")
          (ru/wait-for-deployment))))
