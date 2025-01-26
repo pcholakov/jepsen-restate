@@ -139,7 +139,10 @@
 
  (open! [this test node] (assoc this
                                 :node (str "n" (inc (.indexOf (:nodes test) node)))
-                                :ingress-url (str "http://" node ":8080")))
+                                :ingress-url (str "http://" node ":8080")
+                                :defaults {:connection-manager conn-mgr
+                                           :connection-timeout 500
+                                           :socket-timeout 1000}))
 
  (invoke! [this _test op]
    (let [[k v] (:value op)]
@@ -147,22 +150,22 @@
       (case (:f op)
         :read (let [value
                     (->> (http/get (str (:ingress-url this) "/Register/" k "/get")
-                                   {:connection-manager conn-mgr})
+                                   (:defaults this))
                          (:body)
                          (parse-long-nil))]
                 (assoc op :type :ok :value (independent/tuple k value) :node (:node this)))
 
         :write (do (http/post (str (:ingress-url this) "/Register/" k "/set")
-                              {:body (json/generate-string v)
-                               :content-type :json
-                               :connection-manager conn-mgr})
+                              (merge (:defaults this)
+                                     {:body (json/generate-string v)
+                                      :content-type :json}))
                    (assoc op :type :ok :node (:node this)))
 
         :cas (let [[old new] v]
                (http/post (str (:ingress-url this) "/Register/" k "/cas")
-                          {:body (json/generate-string {:expected old :newValue new})
-                           :content-type :json
-                           :connection-manager conn-mgr})
+                          (merge (:defaults this)
+                                 {:body (json/generate-string {:expected old :newValue new})
+                                  :content-type :json}))
                (assoc op :type :ok :node (:node this))))
 
       (catch [:status 412] {} (assoc op :type :fail :error :precondition-failed :node (:node this)))
@@ -299,7 +302,7 @@
 
 (def nemeses
   "A map of nemeses."
-  {"none" nil
+  {"none"                  nemesis/noop
    "container-killer"      (nemesis/node-start-stopper
                             rand-nth
                             (fn start [_t _n]
@@ -325,22 +328,20 @@
            (if (not (:dummy? (:ssh opts))) {:os debian/os} nil)
            {:pure-generators true
             :name            (str "restate-" (name (:workload opts)))
-            :db              (restate {:num-partitions 3})
+            :db              (restate {:num-partitions 1})
             :client          (:client workload)
             :nemesis         (get nemeses (:nemesis opts))
             :generator       (gen/phases
                               (->> (:generator workload)
                                    (gen/stagger (/ (:rate opts)))
-                                   (gen/nemesis (cycle [(gen/sleep 5)
-                                                        {:type :info, :f :start}
-                                                        (gen/sleep 5)
-                                                        {:type :info, :f :stop}]))
+                                   (gen/nemesis (cycle [(gen/sleep 5) {:type :info, :f :start}
+                                                        (gen/sleep 5) {:type :info, :f :stop}]))
                                    (gen/time-limit (:time-limit opts)))
-                              (gen/nemesis [{:type :info, :f :stop}])
-                              (->>
-                               (gen/clients (:generator workload))
-                               (gen/stagger (/ (:rate opts)))
-                               (gen/time-limit 5)))
+                              (gen/log "Healing cluster")
+                              (gen/once (gen/nemesis [{:type :info, :f :stop}]))
+                              (->> (:generator workload)
+                                   (gen/stagger (/ (:rate opts)))
+                                   (gen/time-limit 5)))
             :checker         (checker/compose
                               {:perf       (checker/perf)
                                :stats      (checker/stats)
@@ -357,7 +358,7 @@
     :validate (workloads (cli/one-of workloads))]
    ["-N" "--nemesis NAME" "Nemesis to apply"
     :default "none"
-    :validate (workloads (cli/one-of workloads))]
+    :validate (nemeses (cli/one-of nemeses))]
    ["-r" "--rate HZ" "Approximate number of requests per second, per thread."
     :default  10
     :parse-fn read-string
