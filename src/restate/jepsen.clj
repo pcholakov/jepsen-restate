@@ -12,8 +12,7 @@
     [generator :as gen]
     [independent :as independent]
     [nemesis :as nemesis]
-    [tests :as tests]
-    [util :as util]]
+    [tests :as tests]]
    [jepsen.checker.timeline :as timeline]
    [jepsen.control.util :as cu]
    [jepsen.os.debian :as debian]
@@ -22,6 +21,7 @@
    [cheshire.core :as json]
    [slingshot.slingshot :refer [try+]]
    [knossos.model :as model]
+   [restate.util :as ru]
    [restate.jepsen.set :as mds-set]))
 
 (def resources-relative-path ".")
@@ -32,22 +32,6 @@
 (def services-args (str server-services-dir "services.js"))
 (def services-pidfile (str server-services-dir "services.pid"))
 (def services-logfile (str server-services-dir "services.log"))
-
-(defn get-nodes-count []
-  (-> (c/exec :docker :exec :restate  :restatectl :meta :get :-k "nodes_config" :| :jq ".nodes | length")
-      Integer/parseInt))
-
-(defn get-logs-count []
-  (-> (c/exec :docker :exec :restate  :restatectl :meta :get :-k "bifrost_config" :| :jq ".logs | length")
-      Integer/parseInt))
-
-(defn wait-for-nodes [expected-count]
-  (util/await-fn
-   (fn [] (when (= (get-nodes-count) expected-count) true))))
-
-(defn wait-for-logs [expected-count]
-  (util/await-fn
-   (fn [] (when (= (get-logs-count) expected-count) true))))
 
 (defn restate
   "A deployment of Restate along with the required test services."
@@ -106,37 +90,24 @@
          (cu/await-tcp-port 9070)
 
          (info "Waiting for all nodes to join cluster and partitions to be configured")
-         (wait-for-logs (:num-partitions opts))
+         (ru/wait-for-metadata-servers (count (:nodes test)))
+         (ru/wait-for-logs (:num-partitions opts))
+         (ru/wait-for-partition-leaders (:num-partitions opts))
+         (ru/wait-for-partition-followers (* (:num-partitions opts) (dec (count (:nodes test)))))
 
          (when (= node (first (:nodes test)))
            (info "Performing once-off setup")
-
-           (c/exec :docker :exec :restate :restatectl :metadata :patch
-                   :--key "nodes_config" :--patch
-                   (str "["
-                        (str/join ","
-                                  (for [node-idx (range (count (:nodes test)))]
-                                    (str "{\"op\": \"replace\", \"path\": \"/nodes/" node-idx
-                                         "/1/Node/metadata_server_config/metadata_server_state\", \"value\": \"member\"}")))
-                        "]"))
-
-           (info "Patched nodes configuration:" (c/exec :docker :exec :restate :restatectl :metadata :get :-k "nodes_config"))
-
-           (c/exec :docker :exec :restate :restate :deployments :register "http://host.docker.internal:9080" :--yes)
-
+           (ru/restate :deployments :register "http://host.docker.internal:9080" :--yes)
            (when (> (count (:nodes test)) 2)
              (let [replication-factor (int (+ 1 (m/floor (/ (count (:nodes test)) 2))))]
                (info "Reconfiguring all logs with replication factor:" replication-factor)
                (doseq [log-id (range (:num-partitions opts))]
-                 (info "Exec:" :docker :exec :restate :restatectl :logs :reconfigure
-                       :--log-id log-id :--provider :replicated
-                       :--replication-factor-nodes replication-factor)
-                 (c/exec :docker :exec :restate :restatectl :logs :reconfigure
-                         :--log-id log-id :--provider :replicated
-                         :--replication-factor-nodes replication-factor)))))
+                 (ru/restatectl :logs :reconfigure
+                                :--log-id log-id :--provider :replicated
+                                :--replication-factor-nodes replication-factor)))))
 
-         ;; TODO: replace with wait-for-healthy, not just listening
-         (cu/await-tcp-port 8080))))
+         (info "Waiting for service deployment")
+         (ru/wait-for-deployment))))
 
     (teardown! [_this test node]
       (when (not (:dummy? (:ssh test)))
