@@ -311,6 +311,15 @@
                             (fn stop [_t _n]
                               (c/su (c/exec :docker :start "restate"))
                               [:restarted "restate-server"]))
+   "nuke-partition-state"  (nemesis/node-start-stopper
+                            rand-nth
+                            (fn start [_t _n]
+                              (c/su (c/exec :docker :kill :-s :KILL "restate")
+                                    (c/exec :rm :-rf "/opt/restate/restate-data/n1/db/"))
+                              [:killed "restate-server"])
+                            (fn stop [_t _n]
+                              (c/su (c/exec :docker :start "restate"))
+                              [:restarted "restate-server"]))
    "partition-random-node" (nemesis/partition-random-node)})
 
 (defn restate-test
