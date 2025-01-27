@@ -88,9 +88,8 @@
   [opts]
   {:client    (RegisterClient. (hu/connection-manager))
    :checker   (independent/checker
-               (checker/compose
-                {:linear   (checker/linearizable {:model     (model/cas-register)
-                                                  :algorithm :linear})}))
+               (checker/linearizable {:model     (model/cas-register)
+                                      :algorithm :linear}))
    :generator (independent/concurrent-generator
                (:concurrency opts)
                (range)

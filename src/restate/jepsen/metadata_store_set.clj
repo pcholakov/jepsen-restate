@@ -6,9 +6,9 @@
     [checker :as checker]
     [generator :as gen]]
    [clj-http.client :as http]
-   [clj-http.conn-mgr :as conn-mgr]
    [cheshire.core :as json]
-   [slingshot.slingshot :refer [try+]]))
+   [slingshot.slingshot :refer [try+]]
+   [restate [http :as hu]]))
 
 (defrecord
  SetClient [key conn-mgr] client/Client
@@ -17,9 +17,7 @@
    (assoc this
           :node (str "n" (inc (.indexOf (:nodes test) node)))
           :endpoint (str "http://" node ":9070/metadata/")
-          :defaults {:connection-manager
-                     (conn-mgr/make-reusable-conn-manager
-                      {:timeout 2 :default-per-route 20 :threads 100})
+          :defaults {:connection-manager conn-mgr
                      :connection-timeout 500
                      :socket-timeout 1000}
           :random (new java.util.Random)))
@@ -73,7 +71,7 @@
 
 (defn workload
   "Restate Metadata Store-backed Set test workload."
-  [opts]
-  {:client    (SetClient. "jepsen-set" (:http-connection-manager opts))
+  [_opts]
+  {:client    (SetClient. "jepsen-set" (hu/connection-manager))
    :checker   (checker/set-full {:linearizable? true})
    :generator (gen/reserve 5 (repeat (r)) (w))})
