@@ -1,11 +1,14 @@
-(ns restate.jepsen.set
-  (:require [jepsen [client :as client]
-             [checker :as checker]
-             [generator :as gen]]
-            [clj-http.client :as http]
-            [clj-http.conn-mgr :as conn-mgr]
-            [cheshire.core :as json]
-            [slingshot.slingshot :refer [try+]]))
+(ns restate.jepsen.metadata-store-set
+  "A set client implemented on top of the Restate Metadata Store HTTP API.
+  Note: restate-server must be compiled with the metadata-api feature."
+  (:require
+   [jepsen [client :as client]
+    [checker :as checker]
+    [generator :as gen]]
+   [clj-http.client :as http]
+   [clj-http.conn-mgr :as conn-mgr]
+   [cheshire.core :as json]
+   [slingshot.slingshot :refer [try+]]))
 
 (defrecord
  SetClient [key conn-mgr] client/Client
@@ -24,10 +27,9 @@
  (setup! [this _test]
    (http/put (str (:endpoint this) key)
              (merge (:defaults this)
-                    (merge (:defaults this)
-                           {:body (json/generate-string #{})
-                            :headers {:If-Match "*" :ETag 1}
-                            :content-type :json}))))
+                    {:body (json/generate-string #{})
+                     :headers {:If-Match "*" :ETag 1}
+                     :content-type :json})))
 
  (invoke! [this _test op]
    (case (:f op)
@@ -70,7 +72,7 @@
   {:type :invoke, :f :read, :value nil})
 
 (defn workload
-  "A generator, client, and checker for a set test."
+  "Restate Metadata Store-backed Set test workload."
   [opts]
   {:client    (SetClient. "jepsen-set" (:http-connection-manager opts))
    :checker   (checker/set-full {:linearizable? true})

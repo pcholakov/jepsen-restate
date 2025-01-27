@@ -17,3 +17,4 @@ store/
 node-modules/
 /services/dist
 /services/restate-data/
+nodes.txt
